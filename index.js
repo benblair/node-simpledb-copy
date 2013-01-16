@@ -12,7 +12,8 @@ var secretAccessKey = env.SECRET_ACCESS_KEY;
 var writeDomainTag  = env.WRITE_DOMAIN_TAG || '';
 var readRegion      = env.READ_REGION || amazon.US_EAST_1;
 var writeRegion     = env.WRITE_REGION || amazon.US_WEST_2;
-var includeActivityTable = env.INCLUDE_ACTIVITY_TABLE || false;
+var lastTimestamp   = env.LAST_TIMESTAMP || '';
+
 var deleteCopyDomainPriorToCopy = env.DELETE_DOMAIN_PRIOR_TO_COPY || false;
 
 var SELECT_LIMIT = '25';     // few at a time to ensure lower error rate on write
@@ -25,12 +26,12 @@ var EXCLUDE_DOMAINS = [
 var INCLUDE_DOMAINS = [
     'auth', 'manufacturers', 'inventory', 'member_plans', 'order_history', 
     'orders', 'payments', 'products', 'trades', 'transactions', 'uploads',
-    'users', 'watchlists', 'price-observations'
+    'users', 'watchlists', 'price-observations', 'activity'
 ];
 
-if (includeActivityTable) {
-    INCLUDE_DOMAINS.push('activity');
-}
+var COPY_NEWEST_ONLY_DOMAINS = [
+    'activity'
+];
 
 var readSdb = new SimpleDB({
     'accessKeyId'     : accessKeyId,
@@ -166,10 +167,12 @@ function copyDomains(nextToken, callback) {
             }
 
             var recordCount = data.Body.DomainMetadataResponse.DomainMetadataResult.ItemCount;
+            var copyNewestOnly = COPY_NEWEST_ONLY_DOMAINS.indexOf(domain) >= 0;
 
-            console.log('Copying domain "' + domain + '" with ' + recordCount + ' records...');
+            console.log('Copying domain "' + domain + '" with ' + (!copyNewestOnly ? recordCount + ' records...' : 'data starting at ' + lastTimestamp));
 
-            ensureWriteDomain(writeDomain, function(err) {
+
+            ensureWriteDomain(writeDomain, copyNewestOnly, function(err) {
 
                 if (err) {
                     callback(err);
@@ -178,7 +181,7 @@ function copyDomains(nextToken, callback) {
 
                 domainsCopied += 1;
 
-                copyRecords(domain, writeDomain, 0, recordCount, null, function(err, result) {
+                copyRecords(domain, writeDomain, 0, recordCount, copyNewestOnly, lastTimestamp, null, function(err, result) {
 
                     if (err) {
                         callback(err);
@@ -197,7 +200,7 @@ function copyDomains(nextToken, callback) {
     });
 }
 
-function ensureWriteDomain(domain, callback) {
+function ensureWriteDomain(domain, copyNewestOnly, callback) {
     retryWithBackoff(writeSdb, writeSdb.DomainMetadata, 5)({ DomainName: domain }, function(err, data) {
         if (err) {
 
@@ -224,7 +227,7 @@ function ensureWriteDomain(domain, callback) {
             callback(err);
             return;
         }
-        else if (deleteCopyDomainPriorToCopy) {
+        else if (deleteCopyDomainPriorToCopy && !copyNewestOnly) {
             retryWithBackoff(writeSdb, writeSdb.DeleteDomain, 5)({ DomainName: domain }, function(err, data) {
                 if (err) {
                     console.log('Unable to delete domain "' + domain + '" in write region "' + writeRegion + '"');
@@ -248,14 +251,25 @@ function ensureWriteDomain(domain, callback) {
     });
 }
 
-function copyRecords(readDomain, writeDomain, copiedRecords, recordCount, nextToken, callback) {
+function copyRecords(readDomain, writeDomain, copiedRecords, recordCount, copyNewestOnly, lastTimestamp, nextToken, callback) {
+    
+    var lastTime = new Date(lastTimestamp);
+    if (copyNewestOnly && !lastTime.valueOf()) {
+        console.warn('Unable to copy to "' + writeDomain + '".  Latest timestamp: "' + lastTimestamp +'" does not appear to be a date');
+        return;
+    }
 
     if (!callback && _.isFunction(nextToken)) {
         callback = nextToken;
         nextToken = null;
     }
 
-    var requestParams = { SelectExpression: 'SELECT * FROM `' + readDomain + '` LIMIT ' + SELECT_LIMIT };
+    var whereStatement = '';
+    if (copyNewestOnly) {
+        whereStatement = " WHERE timestamp > '" + lastTime.toISOString() + "' AND timestamp LIKE '20%'";
+    }
+
+    var requestParams = { SelectExpression: 'SELECT * FROM `' + readDomain + '`' + whereStatement + ' LIMIT ' + SELECT_LIMIT };
     if (nextToken) {
         requestParams.NextToken = nextToken;
     }
@@ -291,12 +305,12 @@ function copyRecords(readDomain, writeDomain, copiedRecords, recordCount, nextTo
 
             console.log(
                 'Copied a batch of ' + count + ' records to "' + writeDomain + '" in region "' + writeRegion + '" ' + 
-                '[' + Math.round(100 * (copiedRecords + count) / recordCount) + '%]');
+                (!copyNewestOnly ? '[' + Math.round(100 * (copiedRecords + count) / recordCount) + '%]' : ''));
 
             recordsCopied += count;
 
             if (nextToken) {
-                copyRecords(readDomain, writeDomain, copiedRecords + count, recordCount, nextToken, callback);
+                copyRecords(readDomain, writeDomain, copiedRecords + count, recordCount, copyNewestOnly, lastTimestamp, nextToken, callback);
                 return;
             }
 
