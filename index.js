@@ -12,7 +12,8 @@ var secretAccessKey = env.SECRET_ACCESS_KEY;
 var writeDomainTag  = env.WRITE_DOMAIN_TAG || '';
 var readRegion      = env.READ_REGION || amazon.US_EAST_1;
 var writeRegion     = env.WRITE_REGION || amazon.US_WEST_2;
-var lastTimestamp   = env.LAST_TIMESTAMP || '';
+var lastTimestamp   = env.LAST_TIMESTAMP;
+var includeActivity = env.INCLUDE_ACTIVITY;
 
 var deleteCopyDomainPriorToCopy = env.DELETE_DOMAIN_PRIOR_TO_COPY || false;
 
@@ -26,8 +27,12 @@ var EXCLUDE_DOMAINS = [
 var INCLUDE_DOMAINS = [
     'auth', 'manufacturers', 'inventory', 'member_plans', 'order_history', 
     'orders', 'payments', 'products', 'trades', 'transactions', 'uploads',
-    'users', 'watchlists', 'price-observations', 'activity'
+    'users', 'watchlists', 'price-observations'
 ];
+
+if (includeActivity) {
+    INCLUDE_DOMAINS.push('activity');
+}
 
 var COPY_NEWEST_ONLY_DOMAINS = [
     'activity'
@@ -52,6 +57,15 @@ var recordsCopied = 0;
 
 var skippedBatches = [];
 var processedDomains = {};
+
+if (!lastTimestamp) {
+    lastTimestamp = new Date();
+    lastTimestamp.setHours(18);
+    lastTimestamp.setMinutes(0);
+    lastTimestamp.setSeconds(0);
+    lastTimestamp.setMilliseconds(0);
+    lastTimestamp.setDate(lastTimestamp.getDate() - 1);
+}
 
 var retryWithBackoff = function(obj, f, maxTries) {
     return function() {
@@ -170,7 +184,6 @@ function copyDomains(nextToken, callback) {
             var copyNewestOnly = COPY_NEWEST_ONLY_DOMAINS.indexOf(domain) >= 0;
 
             console.log('Copying domain "' + domain + '" with ' + (!copyNewestOnly ? recordCount + ' records...' : 'data starting at ' + lastTimestamp));
-
 
             ensureWriteDomain(writeDomain, copyNewestOnly, function(err) {
 
