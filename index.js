@@ -1,7 +1,6 @@
 // node-simpledb-copy
 // copies simpledb from one account / region to another
 // use with caution! Doesn't check anything before overwriting. Actually, just don't use this :)
-
 var _ = require('underscore');
 var awssum = require('awssum');
 var amazon = awssum.load('amazon/amazon');
@@ -10,41 +9,45 @@ var SimpleDB = awssum.load('amazon/simpledb').SimpleDB;
 var env             = process.env;
 var accessKeyId     = env.ACCESS_KEY_ID;
 var secretAccessKey = env.SECRET_ACCESS_KEY;
+var writeDomainTag  = env.WRITE_DOMAIN_TAG || '';
+var readRegion      = env.READ_REGION || amazon.US_EAST_1;
+var writeRegion     = env.WRITE_REGION || amazon.US_WEST_2;
+var lastTimestamp   = env.LAST_TIMESTAMP;
+var includeActivity = env.INCLUDE_ACTIVITY;
 
-var READ_REGION = amazon.US_EAST_1;
-var WRITE_REGION = amazon.US_WEST_2;
+var deleteCopyDomainPriorToCopy = env.DELETE_DOMAIN_PRIOR_TO_COPY || false;
+
 var SELECT_LIMIT = '25';     // few at a time to ensure lower error rate on write
 var CONSISTENT_READ = false; // faster
 var EXCLUDE_DOMAINS = [
-    'activity', 'auth', 'companies', 'inventory-test', 
-    'price-histograms-test', 'price-observations', 'price-observations-test'
+    'inventory-test', 
+    'price-histograms-test', 'price-observations-test'
 ];
-// since we already copied these before crashing...
-EXCLUDE_DOMAINS = EXCLUDE_DOMAINS.concat([
-    'inventory',
-    'manufacturers',
-    'member_plans',
-    'order_history',
-    'orders',
-    'payments',
-    // 'price-histograms' // didn't actually finish, just skipping for priority's sake
-    'products',
-    'trades',
-    'transactions',
-    'uploads',
-    'users'
-]);
+
+var INCLUDE_DOMAINS = [
+    'auth', 'manufacturers', 'inventory', 'member_plans', 'order_history', 
+    'orders', 'payments', 'products', 'trades', 'transactions', 'uploads',
+    'users', 'watchlists', 'price-observations'
+];
+
+if (includeActivity) {
+    INCLUDE_DOMAINS.push('activity');
+}
+
+var COPY_NEWEST_ONLY_DOMAINS = [
+    'activity'
+];
 
 var readSdb = new SimpleDB({
     'accessKeyId'     : accessKeyId,
     'secretAccessKey' : secretAccessKey,
-    'region'          : READ_REGION
+    'region'          : readRegion
 });
 
 var writeSdb = new SimpleDB({
     'accessKeyId'     : accessKeyId,
     'secretAccessKey' : secretAccessKey,
-    'region'          : WRITE_REGION
+    'region'          : writeRegion
 });
 
 var readBoxUsage = 0;
@@ -53,6 +56,46 @@ var domainsCopied = 0;
 var recordsCopied = 0;
 
 var skippedBatches = [];
+var processedDomains = {};
+
+if (!lastTimestamp) {
+    lastTimestamp = new Date();
+    lastTimestamp.setHours(18);
+    lastTimestamp.setMinutes(0);
+    lastTimestamp.setSeconds(0);
+    lastTimestamp.setMilliseconds(0);
+    lastTimestamp.setDate(lastTimestamp.getDate() - 1);
+}
+
+var retryWithBackoff = function(obj, f, maxTries) {
+    return function() {
+        // make then invoke the invokeWithTries
+        var args = Array.prototype.slice.call(arguments);
+        callback = args.slice(-1)[0];
+        (function invokeWithTry(tries) {
+            var wrappedCallback =  function() {
+                var cbArgs = Array.prototype.slice.call(arguments);
+                var err = cbArgs[0];
+                if (err && err.Body.Response.Errors.Error.Code === 'ServiceUnavailable') {
+                    if (tries > maxTries) { 
+                        console.log('Max tries reached, stopping retry');
+                        return callback(err);
+                    }
+                    console.log('Retrying...');
+                    setTimeout(function() {
+                        invokeWithTry(tries + 1);
+                    }, 4 ^ tries * 100); 
+                    // ^ Back off exponentially per http://aws.amazon.com/articles/Amazon-SimpleDB/1394
+                }
+                else {
+                    callback.apply(null, cbArgs);
+                }
+            }
+            args[args.length - 1] = wrappedCallback;
+            f.apply(obj, args);
+        })(1);
+    }
+}
 
 function reportResults() {
     console.log('Total read box usage: ' + readBoxUsage);
@@ -64,7 +107,10 @@ function reportResults() {
 }
 
 function copyDomains(nextToken, callback) {
-
+    if (!writeDomainTag && readRegion === writeRegion) {
+        console.error('Can not copy from "' + readRegion + '" to "' + writeRegion + '" as no WRITE_DOMAIN_TAG specified.');
+        return;
+    }
     if (!callback && _.isFunction(nextToken)) {
         callback = nextToken;
         nextToken = null;
@@ -75,7 +121,7 @@ function copyDomains(nextToken, callback) {
         requestParams.NextToken = nextToken;
     }
 
-    readSdb.ListDomains(requestParams, function(err, data) {
+    retryWithBackoff(readSdb, readSdb.ListDomains, 5)(requestParams, function(err, data) {
         if (err) {
             callback(err);
             return;
@@ -92,6 +138,12 @@ function copyDomains(nextToken, callback) {
             return;
         }
 
+        if (processedDomains[domain]) {
+            console.log('Seen this domain before, exiting');
+            callback();
+            return;
+        }
+
         if (EXCLUDE_DOMAINS.indexOf(domain) >= 0) {
 
             console.log('Skipping excluded domain "' + domain + '"');
@@ -101,7 +153,27 @@ function copyDomains(nextToken, callback) {
 
         }
 
-        readSdb.DomainMetadata({ DomainName: domain }, function(err, data) {
+        if (INCLUDE_DOMAINS.length > 0 && INCLUDE_DOMAINS.indexOf(domain) < 0) {
+
+            console.log('Skipping non included domain "' + domain + '"');
+
+            copyDomains(nextToken, callback);
+            return;
+        }
+
+        processedDomains[domain] = true;
+
+        var writeDomain = domain + (writeDomainTag ? '-' + writeDomainTag : '');
+
+        if (writeDomainTag && writeDomain === domain) {
+            // Don't copy when we already have a domain copy in this region
+            console.log('Skipping domain that is a copy "' + domain + '"');
+
+            copyDomains(nextToken, callback);
+            return;
+        }
+
+        retryWithBackoff(readSdb, readSdb.DomainMetadata, 5)({ DomainName: domain }, function(err, data) {
 
             if (err) {
                 callback(err);
@@ -109,10 +181,11 @@ function copyDomains(nextToken, callback) {
             }
 
             var recordCount = data.Body.DomainMetadataResponse.DomainMetadataResult.ItemCount;
+            var copyNewestOnly = COPY_NEWEST_ONLY_DOMAINS.indexOf(domain) >= 0;
 
-            console.log('Copying domain "' + domain + '" with ' + recordCount + ' records...');
+            console.log('Copying domain "' + domain + '" with ' + (!copyNewestOnly ? recordCount + ' records...' : 'data starting at ' + lastTimestamp));
 
-            ensureWriteDomain(domain, function(err) {
+            ensureWriteDomain(writeDomain, copyNewestOnly, function(err) {
 
                 if (err) {
                     callback(err);
@@ -121,7 +194,7 @@ function copyDomains(nextToken, callback) {
 
                 domainsCopied += 1;
 
-                copyRecords(domain, 0, recordCount, null, function(err, result) {
+                copyRecords(domain, writeDomain, 0, recordCount, copyNewestOnly, lastTimestamp, null, function(err, result) {
 
                     if (err) {
                         callback(err);
@@ -140,19 +213,19 @@ function copyDomains(nextToken, callback) {
     });
 }
 
-function ensureWriteDomain(domain, callback) {
-    writeSdb.DomainMetadata({ DomainName: domain }, function(err, data) {
+function ensureWriteDomain(domain, copyNewestOnly, callback) {
+    retryWithBackoff(writeSdb, writeSdb.DomainMetadata, 5)({ DomainName: domain }, function(err, data) {
         if (err) {
 
             if (err.Body.Response.Errors.Error.Code === 'NoSuchDomain') {
 
-                writeSdb.CreateDomain({ DomainName: domain }, function(err, data) {
+                retryWithBackoff(writeSdb, writeSdb.CreateDomain, 5)({ DomainName: domain }, function(err, data) {
                     if (err) {
                         callback(err);
                         return;
                     }
 
-                    console.log('Created domain "' + domain + '" in write region "' + WRITE_REGION + '"');
+                    console.log('Created domain "' + domain + '" in write region "' + writeRegion + '"');
 
                     // once got a 'domain does not exist' error right after creating domain, so maybe just 
                     // need to give it some time...
@@ -167,28 +240,57 @@ function ensureWriteDomain(domain, callback) {
             callback(err);
             return;
         }
+        else if (deleteCopyDomainPriorToCopy && !copyNewestOnly) {
+            retryWithBackoff(writeSdb, writeSdb.DeleteDomain, 5)({ DomainName: domain }, function(err, data) {
+                if (err) {
+                    console.log('Unable to delete domain "' + domain + '" in write region "' + writeRegion + '"');
+                    callback(err);
+                    return;
+                }
 
-        callback();
+                console.log('Deleted domain "' + domain + '" in write region "' + writeRegion + '" prior to copy');
 
+                setTimeout(function() {
+                    ensureWriteDomain(domain, callback);
+                }, 10000);
+
+                // Don't call the callback since the recursive call to ensureWriteDomain will do so.
+            });
+        }
+        else
+        {
+            callback();
+        }
     });
 }
 
-function copyRecords(domain, copiedRecords, recordCount, nextToken, callback) {
+function copyRecords(readDomain, writeDomain, copiedRecords, recordCount, copyNewestOnly, lastTimestamp, nextToken, callback) {
+    
+    var lastTime = new Date(lastTimestamp);
+    if (copyNewestOnly && !lastTime.valueOf()) {
+        console.warn('Unable to copy to "' + writeDomain + '".  Latest timestamp: "' + lastTimestamp +'" does not appear to be a date');
+        return;
+    }
 
     if (!callback && _.isFunction(nextToken)) {
         callback = nextToken;
         nextToken = null;
     }
 
-    var requestParams = { SelectExpression: 'SELECT * FROM `' + domain + '` LIMIT ' + SELECT_LIMIT };
+    var whereStatement = '';
+    if (copyNewestOnly) {
+        whereStatement = " WHERE timestamp > '" + lastTime.toISOString() + "' AND timestamp LIKE '20%'";
+    }
+
+    var requestParams = { SelectExpression: 'SELECT * FROM `' + readDomain + '`' + whereStatement + ' LIMIT ' + SELECT_LIMIT };
     if (nextToken) {
         requestParams.NextToken = nextToken;
     }
     requestParams.ConsistentRead = CONSISTENT_READ;
 
-    readSdb.Select(requestParams, function(err, data) {
+    retryWithBackoff(readSdb, readSdb.Select, 5)(requestParams, function(err, data) {
         if (err) {
-            callback(err);
+            callback(err);                
             return;
         }
 
@@ -196,6 +298,10 @@ function copyRecords(domain, copiedRecords, recordCount, nextToken, callback) {
         readBoxUsage += parseFloat(response.ResponseMetadata.BoxUsage);
         var results = response.SelectResult;
         var items = results.Item;
+        if (items && !_.isArray(items))
+        {
+            items = [items];
+        }
         if (!items || items.length === 0) {
             callback();
             return;
@@ -203,7 +309,7 @@ function copyRecords(domain, copiedRecords, recordCount, nextToken, callback) {
         var count = items.length;
         nextToken = results.NextToken;
 
-        writeRecords(domain, items, function(err, data) {
+        writeRecords(writeDomain, items, function(err, data) {
 
             if (err) {
                 callback(err);
@@ -211,11 +317,13 @@ function copyRecords(domain, copiedRecords, recordCount, nextToken, callback) {
             }
 
             console.log(
-                'Copied a batch of ' + count + ' records to "' + domain + '" in region "' + WRITE_REGION + '" ' + 
-                '[' + Math.round(100 * (copiedRecords + count) / recordCount) + '%]');
+                'Copied a batch of ' + count + ' records to "' + writeDomain + '" in region "' + writeRegion + '" ' + 
+                (!copyNewestOnly ? '[' + Math.round(100 * (copiedRecords + count) / recordCount) + '%]' : ''));
+
+            recordsCopied += count;
 
             if (nextToken) {
-                copyRecords(domain, copiedRecords + count, recordCount, nextToken, callback);
+                copyRecords(readDomain, writeDomain, copiedRecords + count, recordCount, copyNewestOnly, lastTimestamp, nextToken, callback);
                 return;
             }
 
@@ -233,13 +341,25 @@ function prepareForBatchPut(selectedItems) {
     var attributeValues = [];
     var attributeReplaces = [];
 
+    var emptyAttributeList = _.map(selectedItems, function(item) {
+        return !_.every(item.Attribute, function(val) { return _.isEmpty(val.Value)});
+    });
+    var needsAttributeAdded = !_.reduce(emptyAttributeList, function(memo, val) { return memo && val});
     _.each(selectedItems, function(item) {
         keys.push(item.Name);
-        attributeNames.push(_.pluck(item.Attribute, 'Name'));
-        attributeValues.push(_.pluck(item.Attribute, 'Value'));
-        attributeReplaces.push(_.map(_.range(item.Attribute.length), function() { return false }));
+        var attribute = _.filter(item.Attribute, function(val) { return !_.isEmpty(val.Value)});
+        var names = _.pluck(attribute, 'Name');
+        if (needsAttributeAdded) {
+            names = _.union(names, ['itemName']);
+        }
+        attributeNames.push(names);
+        var values = _.pluck(attribute, 'Value');
+        if (needsAttributeAdded) {
+            values = _.union(values, item.Name);
+        }
+        attributeValues.push(values);
+        attributeReplaces.push(_.map(_.range(values.length), function() { return false }));
     });
-
     return {
         keys: keys,
         attributeNames: attributeNames,
@@ -249,7 +369,10 @@ function prepareForBatchPut(selectedItems) {
 }
 
 function writeRecords(domain, items, callback) {
-
+    if (!_.isArray(items))
+    {
+        items = [items];
+    }
     var records = prepareForBatchPut(items);
 
     var requestParams = {
@@ -260,7 +383,7 @@ function writeRecords(domain, items, callback) {
         AttributeReplace: records.attributeReplaces
     };
 
-    writeSdb.BatchPutAttributes(requestParams, function(err, data) {
+    retryWithBackoff(writeSdb, writeSdb.BatchPutAttributes, 5)(requestParams, function(err, data) {
         if (err) {
 
             if (err.Body.Response.Errors.Error.Code === 'SignatureDoesNotMatch') {
