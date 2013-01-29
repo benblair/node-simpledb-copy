@@ -121,7 +121,7 @@ function copyDomains(nextToken, callback) {
         requestParams.NextToken = nextToken;
     }
 
-    retryWithBackoff(readSdb, readSdb.ListDomains, 5)(requestParams, function(err, data) {
+    retryWithBackoff(readSdb, readSdb.ListDomains, 10)(requestParams, function(err, data) {
         if (err) {
             callback(err);
             return;
@@ -173,7 +173,7 @@ function copyDomains(nextToken, callback) {
             return;
         }
 
-        retryWithBackoff(readSdb, readSdb.DomainMetadata, 5)({ DomainName: domain }, function(err, data) {
+        retryWithBackoff(readSdb, readSdb.DomainMetadata, 10)({ DomainName: domain }, function(err, data) {
 
             if (err) {
                 callback(err);
@@ -214,7 +214,7 @@ function copyDomains(nextToken, callback) {
 }
 
 function ensureWriteDomain(domain, copyNewestOnly, callback) {
-    retryWithBackoff(writeSdb, writeSdb.DomainMetadata, 5)({ DomainName: domain }, function(err, data) {
+    retryWithBackoff(writeSdb, writeSdb.DomainMetadata, 10)({ DomainName: domain }, function(err, data) {
         if (err) {
 
             if (err.Body.Response.Errors.Error.Code === 'NoSuchDomain') {
@@ -241,7 +241,7 @@ function ensureWriteDomain(domain, copyNewestOnly, callback) {
             return;
         }
         else if (deleteCopyDomainPriorToCopy && !copyNewestOnly) {
-            retryWithBackoff(writeSdb, writeSdb.DeleteDomain, 5)({ DomainName: domain }, function(err, data) {
+            retryWithBackoff(writeSdb, writeSdb.DeleteDomain, 10)({ DomainName: domain }, function(err, data) {
                 if (err) {
                     console.log('Unable to delete domain "' + domain + '" in write region "' + writeRegion + '"');
                     callback(err);
@@ -288,7 +288,7 @@ function copyRecords(readDomain, writeDomain, copiedRecords, recordCount, copyNe
     }
     requestParams.ConsistentRead = CONSISTENT_READ;
 
-    retryWithBackoff(readSdb, readSdb.Select, 5)(requestParams, function(err, data) {
+    retryWithBackoff(readSdb, readSdb.Select, 10)(requestParams, function(err, data) {
         if (err) {
             callback(err);                
             return;
