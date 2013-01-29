@@ -251,7 +251,7 @@ function ensureWriteDomain(domain, copyNewestOnly, callback) {
                 console.log('Deleted domain "' + domain + '" in write region "' + writeRegion + '" prior to copy');
 
                 setTimeout(function() {
-                    ensureWriteDomain(domain, callback);
+                    ensureWriteDomain(domain, copyNewestOnly, callback);
                 }, 10000);
 
                 // Don't call the callback since the recursive call to ensureWriteDomain will do so.
